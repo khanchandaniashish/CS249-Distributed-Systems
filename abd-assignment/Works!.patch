@@ -1,0 +1,274 @@
+Subject: [PATCH] Works!
+---
+Index: abd-assignment/src/main/java/edu/sjsu/cs249/abd/ABDClient.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/abd-assignment/src/main/java/edu/sjsu/cs249/abd/ABDClient.java b/abd-assignment/src/main/java/edu/sjsu/cs249/abd/ABDClient.java
+new file mode 100644
+--- /dev/null	(date 1676489492623)
++++ b/abd-assignment/src/main/java/edu/sjsu/cs249/abd/ABDClient.java	(date 1676489492623)
+@@ -0,0 +1,65 @@
++package edu.sjsu.cs249.abd;
++
++import io.grpc.ManagedChannelBuilder;
++import picocli.CommandLine;
++
++import java.util.concurrent.Callable;
++import java.util.concurrent.CountDownLatch;
++
++/**
++ * @author ashish
++ */
++public class ABDClient {
++
++ public void writeToDataStore(long addr, long value, String[] servers){
++
++        int n = servers.length;
++        int majority = (n+1)/2;
++
++        for(String server : servers){
++
++            //Create a stub
++            var stub = this.createStub(server);
++            // Get the name
++            var res = stub.name(Grpc.NameRequest.newBuilder().build());
++            System.out.println(res.getName());
++            //Write
++            stub.write(Grpc.WriteRequest.newBuilder().setLabel(System.currentTimeMillis()).setAddr(addr).setValue(value).build());
++            System.out.println(" Server gave me an ACK"+ server);
++
++        }
++
++
++    }
++
++    public void readFromRegister(long register, String[] servers) {
++
++        int n = servers.length;
++        int majority = (n+1)/2;
++
++        for(String server: servers){
++            var stub = this.createStub(server);
++
++            var result = stub.read1(Grpc.Read1Request.newBuilder().setAddr(register).build());
++
++            if(result.getRc() == 0){
++                System.out.println("Label is " + result.getLabel());
++                System.out.println("Value is "+ result.getValue());
++            }
++        }
++
++    }
++
++    private ABDServiceGrpc.ABDServiceBlockingStub createStub(String serverAddress) {
++        var lastColon = serverAddress.lastIndexOf(':');
++        var host = serverAddress.substring(0, lastColon);
++        var port = Integer.parseInt(serverAddress.substring(lastColon+1));
++        var channel = ManagedChannelBuilder
++                .forAddress(host, port)
++                .usePlaintext()
++                .build();
++        return ABDServiceGrpc.newBlockingStub(channel);
++    }
++
++
++}
+Index: abd-assignment/src/main/java/edu/sjsu/cs249/abd/Main.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/abd-assignment/src/main/java/edu/sjsu/cs249/abd/Main.java b/abd-assignment/src/main/java/edu/sjsu/cs249/abd/Main.java
+--- a/abd-assignment/src/main/java/edu/sjsu/cs249/abd/Main.java	(revision d64689443815e9a6cb86acb4b28749594dcf080f)
++++ b/abd-assignment/src/main/java/edu/sjsu/cs249/abd/Main.java	(date 1676489640693)
+@@ -19,7 +19,6 @@
+     static class ServerCli implements Callable<Integer> {
+         @Parameters(index = "0", description = "host:port listen on.")
+         int serverPort;
+-
+         @Override
+         public Integer call() throws Exception {
+             System.out.printf("will contact %s\n", serverPort);
+@@ -33,14 +32,19 @@
+         String serverPorts;
+ 
+         @Command
+-        public void read(@Parameters(paramLabel = "register") String register) {
++        public void read(@Parameters(paramLabel = "register") long register) {
+             System.out.printf("Going to read %s from %s\n", register, serverPorts);
++            System.out.println("Read called");
++            String[] serversList = serverPorts.split(",");
++            new ABDClient().readFromRegister(register, serversList);
+         }
+ 
+         @Command
+-        public void write(@Parameters(paramLabel = "register") String register,
+-                          @Parameters(paramLabel = "value") String value) {
++        public void write(@Parameters(paramLabel = "register") long register,
++                          @Parameters(paramLabel = "value") long value) {
+             System.out.printf("Going to write %s to %s on %s\n", value, register, serverPorts);
++            String[] serversList = serverPorts.split(",");
++            new ABDClient().writeToDataStore(register, value, serversList);
+         }
+     }
+ }
+Index: abd-assignment/src/main/java/edu/sjsu/cs249/abd/ABDServer.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/abd-assignment/src/main/java/edu/sjsu/cs249/abd/ABDServer.java b/abd-assignment/src/main/java/edu/sjsu/cs249/abd/ABDServer.java
+new file mode 100644
+--- /dev/null	(date 1676424860171)
++++ b/abd-assignment/src/main/java/edu/sjsu/cs249/abd/ABDServer.java	(date 1676424860171)
+@@ -0,0 +1,148 @@
++package edu.sjsu.cs249.abd;
++
++import io.grpc.*;
++import io.grpc.stub.StreamObserver;
++import picocli.CommandLine;
++
++import java.net.SocketAddress;
++import java.util.HashMap;
++import java.util.concurrent.Callable;
++
++import static io.grpc.Grpc.TRANSPORT_ATTR_REMOTE_ADDR;
++
++/**
++ * @author ashish
++ */
++public class ABDServer {
++
++    @CommandLine.Command(subcommands = {ServerCli.class})
++    static class Cli {
++    }
++
++    @CommandLine.Command(name = "server", mixinStandardHelpOptions = true, description = "attendance server for class.")
++    static class ServerCli implements Callable<Integer> {
++        @CommandLine.Parameters(index = "0", description = "port to connect listen on.")
++        int port;
++
++
++        public class Server extends ABDServiceGrpc.ABDServiceImplBase {
++
++            HashMap<Long, Long[]> dataStore = new HashMap<>();
++            boolean read1 = true;
++            boolean write = true;
++            boolean read2 = true;
++
++            @Override
++            public void name(Grpc.NameRequest request, StreamObserver<Grpc.NameResponse> response) {
++                response.onNext(Grpc.NameResponse.newBuilder().setName("Ashish Khanchandani Checking in!").build());
++                response.onCompleted();
++            }
++
++            @Override
++            public void exit(Grpc.ExitRequest exitRequest, StreamObserver<Grpc.ExitResponse> response){
++                System.out.println("Server Shutdown request received");
++                response.onNext(Grpc.ExitResponse.newBuilder().build());
++                response.onCompleted();
++                System.out.println("Shutting the Server down in 3..2...1");
++                System.exit(0);
++            }
++
++            @Override
++            public void write(Grpc.WriteRequest writeRequest, StreamObserver<Grpc.WriteResponse> writeResponse) {
++                if (write) {
++                    System.out.println("Write request received from addr : " + writeRequest.getAddr());
++                    Long[] array = new Long[2];
++                    array[0]= writeRequest.getLabel();
++                    array[1] = writeRequest.getValue();
++                    dataStore.put(writeRequest.getAddr(), array);
++                    writeResponse.onNext(Grpc.WriteResponse.newBuilder().build());
++                    writeResponse.onCompleted();
++                }
++            }
++
++            @Override
++            public void read1(Grpc.Read1Request read1Request, StreamObserver<Grpc.Read1Response> read1ResponseStreamObserver) {
++                System.out.println("Read1 invoked.");
++                if (read1) {
++
++                    System.out.println("Reading..");
++                    Long addr = read1Request.getAddr();
++                    Grpc.Read1Response response = Grpc.Read1Response.newBuilder().setRc(1).build();
++
++                    //Success case
++                    if (dataStore.containsKey(addr)) {
++                        Long[] array= dataStore.get(addr);
++                        response = Grpc.Read1Response.newBuilder().setRc(0).setLabel(array[0]).setValue(array[1]).build();
++                    }
++                    System.out.println("Read Value  at addr:" + addr + " Label " + response.getLabel() + " Value : " + response.getValue());
++                    read1ResponseStreamObserver.onNext(response);
++                    read1ResponseStreamObserver.onCompleted();
++                }
++            }
++
++            @Override
++            public void read2(Grpc.Read2Request read2Request, StreamObserver<Grpc.Read2Response> read2Response){
++                if(read2) {
++                    Long[] latest = new Long[2];
++                    latest[0] = read2Request.getLabel();
++                    latest[1] = read2Request.getValue();
++                    Long addr = read2Request.getAddr();
++                    if (dataStore.containsKey(addr)) {
++                        System.out.println("executing read 2");
++                        Long[] curr = dataStore.get(read2Request.getAddr());
++                        if (latest[0] > curr[0]) {
++                            dataStore.put(read2Request.getAddr(), latest);
++                            System.out.println("register value : Addr + " + addr + " Label " + latest[0] + " Value " + latest[1]);
++                        }
++                    } else {
++                        dataStore.put(addr,latest);
++                    }
++                    read2Response.onNext(Grpc.Read2Response.newBuilder().build());
++                    read2Response.onCompleted();
++                }
++            }
++
++            @Override
++            public void enableRequests(Grpc.EnableRequest request, StreamObserver<Grpc.EnableResponse> enableResponse){
++                read1 = request.getRead1();
++                read2 = request.getRead2();
++                write = request.getWrite();
++
++                enableResponse.onNext(Grpc.EnableResponse.newBuilder().build());
++                enableResponse.onCompleted();
++            }
++
++//            rpc enableRequests(EnableRequest) returns (EnableResponse);
++//            rpc read1(Read1Request) returns (Read1Response);
++//            rpc read2(Read2Request) returns (Read2Response);
++//            rpc write(WriteRequest) returns (WriteResponse);
++//            // causes the server to immediately exit
++//            rpc exit(ExitRequest) returns (ExitResponse);
++        }
++
++
++        static private Context.Key<SocketAddress> REMOTE_ADDR = Context.key("REMOTE_ADDR");
++
++        @Override
++        public Integer call() throws Exception {
++            System.out.printf("listening on %d\n", port);
++            var server = ServerBuilder.forPort(port).intercept(new ServerInterceptor() {
++                @Override
++                public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> sc, Metadata h,
++                                                                             ServerCallHandler<ReqT, RespT> next) {
++                    var remote = sc.getAttributes().get(TRANSPORT_ATTR_REMOTE_ADDR);
++                    return Contexts.interceptCall(Context.current().withValue(REMOTE_ADDR, remote),
++                            sc, h, next);
++                }
++            }).addService(new Server()).build();
++            server.start();
++            server.awaitTermination();
++            return 0;
++        }
++    }
++
++
++    public static void main(String[] args) {
++        System.exit(new CommandLine(new Cli()).execute(args));
++    }
++}
